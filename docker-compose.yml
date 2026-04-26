@@ -1,6 +1,6 @@
 services:
   checker:
-    build: .
+    image: ghcr.io/bassrock/gilroy-permits:latest
     volumes:
       - ./data:/data
     ports:
