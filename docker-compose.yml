@@ -1,0 +1,12 @@
+services:
+  checker:
+    build: .
+    volumes:
+      - ./data:/data
+    ports:
+      - "5001:5000"
+    environment:
+      - SEARCH_TERMS=solar,fiber,frontier
+      - CHECK_TIME=08:00
+      - EXACT_MATCH=false
+    restart: unless-stopped
