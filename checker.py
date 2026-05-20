@@ -65,16 +65,19 @@ def init_db():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS search_terms (
-                term       TEXT PRIMARY KEY,
-                color      TEXT NOT NULL,
-                enabled    INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
+                term        TEXT PRIMARY KEY,
+                color       TEXT NOT NULL,
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                exact_match INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL
             )
         """)
         # Migrate existing DBs that are missing the newer columns
         _add_column_if_missing(conn, "permits", "issue_date", "TEXT")
         _add_column_if_missing(conn, "permits", "lat", "REAL")
         _add_column_if_missing(conn, "permits", "lng", "REAL")
+        _add_column_if_missing(conn, "permits", "favorite", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "search_terms", "exact_match", "INTEGER NOT NULL DEFAULT 0")
 
         _bootstrap_search_terms(conn)
 
@@ -126,14 +129,14 @@ def _bootstrap_search_terms(conn) -> None:
 
 def get_search_terms(enabled_only: bool = True) -> list[dict]:
     with get_db() as conn:
-        q = "SELECT term, color, enabled, created_at FROM search_terms"
+        q = "SELECT term, color, enabled, exact_match, created_at FROM search_terms"
         if enabled_only:
             q += " WHERE enabled = 1"
         q += " ORDER BY created_at ASC"
         return [dict(r) for r in conn.execute(q)]
 
 
-def add_search_term(term: str, color: str | None = None) -> dict:
+def add_search_term(term: str, color: str | None = None, exact_match: bool = False) -> dict:
     term = term.strip()
     if not term:
         raise ValueError("term required")
@@ -145,14 +148,24 @@ def add_search_term(term: str, color: str | None = None) -> dict:
             color = _next_color(used)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         conn.execute(
-            "INSERT INTO search_terms (term, color, enabled, created_at) VALUES (?,?,1,?)",
-            (term, color, now),
+            "INSERT INTO search_terms (term, color, enabled, exact_match, created_at)"
+            " VALUES (?,?,1,?,?)",
+            (term, color, 1 if exact_match else 0, now),
         )
-    log.info("Added search term: %s", term)
-    return {"term": term, "color": color, "enabled": 1, "created_at": now}
+    log.info("Added search term: %s (exact=%s)", term, exact_match)
+    return {
+        "term": term, "color": color, "enabled": 1,
+        "exact_match": 1 if exact_match else 0, "created_at": now,
+    }
 
 
-def update_search_term(term: str, *, enabled: bool | None = None, color: str | None = None) -> None:
+def update_search_term(
+    term: str,
+    *,
+    enabled: bool | None = None,
+    color: str | None = None,
+    exact_match: bool | None = None,
+) -> None:
     sets, args = [], []
     if enabled is not None:
         sets.append("enabled = ?")
@@ -160,6 +173,9 @@ def update_search_term(term: str, *, enabled: bool | None = None, color: str | N
     if color:
         sets.append("color = ?")
         args.append(color)
+    if exact_match is not None:
+        sets.append("exact_match = ?")
+        args.append(1 if exact_match else 0)
     if not sets:
         return
     args.append(term)
@@ -169,19 +185,28 @@ def update_search_term(term: str, *, enabled: bool | None = None, color: str | N
             raise KeyError(term)
 
 
-def delete_search_term(term: str) -> None:
+def delete_search_term(term: str, *, cascade_permits: bool = False) -> int:
+    """Delete a search term. If cascade_permits, also delete permits tagged with it.
+
+    Returns the number of permits removed (0 when cascade_permits is False).
+    """
     with get_db() as conn:
+        permits_deleted = 0
+        if cascade_permits:
+            cur = conn.execute("DELETE FROM permits WHERE keyword = ?", (term,))
+            permits_deleted = cur.rowcount
         cur = conn.execute("DELETE FROM search_terms WHERE term = ?", (term,))
         if cur.rowcount == 0:
             raise KeyError(term)
-    log.info("Deleted search term: %s", term)
+    log.info("Deleted search term: %s (cascaded %d permit(s))", term, permits_deleted)
+    return permits_deleted
 
 
-def _build_body(keyword: str, page: int) -> dict:
+def _build_body(keyword: str, page: int, exact_match: bool = EXACT_MATCH) -> dict:
     empty = {"PageNumber": 0, "PageSize": 0, "SortBy": None, "SortAscending": False}
     return {
         "Keyword": keyword,
-        "ExactMatch": EXACT_MATCH,
+        "ExactMatch": exact_match,
         "SearchModule": 1,
         "FilterModule": 2,
         "SearchMainAddress": False,
@@ -221,8 +246,11 @@ def _build_body(keyword: str, page: int) -> dict:
     }
 
 
-def _fetch_page(keyword: str, page: int) -> dict:
-    resp = requests.post(API_URL, json=_build_body(keyword, page), headers=_HEADERS, timeout=30)
+def _fetch_page(keyword: str, page: int, exact_match: bool = EXACT_MATCH) -> dict:
+    resp = requests.post(
+        API_URL, json=_build_body(keyword, page, exact_match),
+        headers=_HEADERS, timeout=30,
+    )
     resp.raise_for_status()
     return resp.json()["Result"]
 
@@ -230,7 +258,7 @@ def _fetch_page(keyword: str, page: int) -> dict:
 def run_check() -> int:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     total_new = 0
-    terms = [t["term"] for t in get_search_terms(enabled_only=True)]
+    terms = get_search_terms(enabled_only=True)
     if not terms:
         log.warning("No enabled search terms — skipping run.")
         with get_db() as conn:
@@ -238,14 +266,16 @@ def run_check() -> int:
         return 0
 
     with get_db() as conn:
-        for keyword in terms:
-            log.info("Checking %r", keyword)
+        for t in terms:
+            keyword = t["term"]
+            exact = bool(t.get("exact_match"))
+            log.info("Checking %r (exact_match=%s)", keyword, exact)
             new_permits = []
             page = 1
 
             while True:
                 try:
-                    result = _fetch_page(keyword, page)
+                    result = _fetch_page(keyword, page, exact_match=exact)
                 except Exception as exc:
                     log.error("API error on page %d for %r: %s", page, keyword, exc)
                     break

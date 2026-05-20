@@ -88,6 +88,10 @@ a{color:#2563eb;text-decoration:none}
 a:hover{text-decoration:underline}
 .hidden{display:none}
 .desc{color:#6b7280;font-size:.78rem;margin-top:.25rem;line-height:1.4}
+.star{background:none;border:0;font-size:1.1rem;line-height:1;cursor:pointer;color:#d1d5db;padding:.1rem .25rem}
+.star.on{color:#f59e0b}
+.star:hover{color:#f59e0b}
+.star-col{width:32px}
 </style>
 </head>
 <body>
@@ -102,21 +106,26 @@ a:hover{text-decoration:underline}
   <input type="text" id="filter" placeholder="Search…" oninput="go()">
   <select id="kw" onchange="go()">
     <option value="">All keywords</option>
-    {% for kw, color in keywords %}
-    <option value="{{ kw }}">{{ kw }}</option>
+    {% for kw in keywords %}
+    <option value="{{ kw['term'] }}">{{ kw['term'] }}{% if not kw['enabled'] %} (disabled){% endif %}</option>
     {% endfor %}
   </select>
   <label><input type="checkbox" id="newonly" onchange="go()"> New (last 7 days)</label>
+  <label><input type="checkbox" id="favonly" onchange="go()"> &#9733; Favorites only</label>
 </div>
 <div class="wrap">
 <table id="tbl">
   <thead><tr>
+    <th class="star-col"></th>
     <th>Permit #</th><th>Type</th><th>Status</th><th>Address</th>
     <th>Apply Date</th><th>Keyword</th><th>First Seen</th>
   </tr></thead>
   <tbody>
   {% for p in permits %}
-  <tr data-kw="{{ p['keyword'] }}" data-new="{{ 'y' if p['is_new'] else 'n' }}">
+  <tr data-kw="{{ p['keyword'] }}" data-new="{{ 'y' if p['is_new'] else 'n' }}" data-fav="{{ 'y' if p['favorite'] else 'n' }}" data-cid="{{ p['case_id'] }}">
+    <td class="star-col">
+      <button class="star {% if p['favorite'] %}on{% endif %}" title="Favorite" onclick="toggleFav(this)">{% if p['favorite'] %}&#9733;{% else %}&#9734;{% endif %}</button>
+    </td>
     <td>
       <a href="/permit/{{ p['case_id'] }}">{{ p['case_number'] }}</a>
       {% if p['is_new'] %}<span class="badge">NEW</span>{% endif %}
@@ -143,12 +152,28 @@ function go(){
   const txt=document.getElementById('filter').value.toLowerCase();
   const kw=document.getElementById('kw').value;
   const no=document.getElementById('newonly').checked;
+  const fo=document.getElementById('favonly').checked;
   let n=0;
   document.querySelectorAll('#tbl tbody tr').forEach(r=>{
-    const ok=(!txt||r.textContent.toLowerCase().includes(txt))&&(!kw||r.dataset.kw===kw)&&(!no||r.dataset.new==='y');
+    const ok=(!txt||r.textContent.toLowerCase().includes(txt))
+           &&(!kw||r.dataset.kw===kw)
+           &&(!no||r.dataset.new==='y')
+           &&(!fo||r.dataset.fav==='y');
     r.classList.toggle('hidden',!ok); if(ok)n++;
   });
   document.getElementById('vis').textContent=n;
+}
+async function toggleFav(btn){
+  const row = btn.closest('tr');
+  const cid = row.dataset.cid;
+  const on = btn.classList.contains('on');
+  const method = on ? 'DELETE' : 'PUT';
+  const r = await fetch('/api/permits/' + encodeURIComponent(cid) + '/favorite', {method});
+  if(!r.ok) return;
+  btn.classList.toggle('on');
+  btn.innerHTML = btn.classList.contains('on') ? '&#9733;' : '&#9734;';
+  row.dataset.fav = btn.classList.contains('on') ? 'y' : 'n';
+  go();
 }
 </script>
 </body></html>"""
@@ -159,12 +184,14 @@ def index():
     cutoff = _new_cutoff()
     conn = _db()
     permits = conn.execute(
-        "SELECT *, (first_seen >= ?) AS is_new FROM permits ORDER BY first_seen DESC, apply_date DESC",
+        "SELECT *, (first_seen >= ?) AS is_new FROM permits "
+        "ORDER BY favorite DESC, first_seen DESC, apply_date DESC",
         (cutoff,),
     ).fetchall()
     colors = _kw_color_map(conn)
-    keywords = [(r[0], colors.get(r[0], "#6b7280")) for r in conn.execute(
-        "SELECT DISTINCT keyword FROM permits ORDER BY keyword"
+    # Dropdown lists every search term, enabled first
+    keywords = [dict(r) for r in conn.execute(
+        "SELECT term, enabled FROM search_terms ORDER BY enabled DESC, term ASC"
     ).fetchall()]
     row = conn.execute("SELECT ran_at FROM runs ORDER BY id DESC LIMIT 1").fetchone()
     last_run = row[0][:16].replace("T", " ") if row else "never"
@@ -211,6 +238,7 @@ _DETAIL_HTML = """<!DOCTYPE html>
 </p>
 <div class="card">
   <h2>
+    <button id="star" class="star {% if p['favorite'] %}on{% endif %}" title="Favorite" onclick="toggleFav()" style="background:none;border:0;font-size:1.4rem;cursor:pointer;color:{% if p['favorite'] %}#f59e0b{% else %}#d1d5db{% endif %};padding:0">{% if p['favorite'] %}&#9733;{% else %}&#9734;{% endif %}</button>
     {{ p['case_number'] }}
     <span class="badge-status">{{ p['status'] or 'Unknown' }}</span>
     <span class="kw-pill" style="background:{{ kw_color(p['keyword']) }}">{{ p['keyword'] }}</span>
@@ -243,6 +271,20 @@ _DETAIL_HTML = """<!DOCTYPE html>
   </div>
 </div>
 </div>
+<script>
+const CID = "{{ p['case_id'] }}";
+async function toggleFav(){
+  const btn = document.getElementById('star');
+  const on = btn.classList.contains('on');
+  const r = await fetch('/api/permits/' + encodeURIComponent(CID) + '/favorite',
+    {method: on ? 'DELETE' : 'PUT'});
+  if(!r.ok) return;
+  btn.classList.toggle('on');
+  const nowOn = btn.classList.contains('on');
+  btn.innerHTML = nowOn ? '&#9733;' : '&#9734;';
+  btn.style.color = nowOn ? '#f59e0b' : '#d1d5db';
+}
+</script>
 </body></html>"""
 
 
@@ -446,6 +488,7 @@ td{padding:.55rem .25rem;border-bottom:1px solid #f3f4f6;vertical-align:middle}
   <h2>Add keyword</h2>
   <form class="add" onsubmit="addTerm(event)">
     <input type="text" id="term" placeholder="e.g. Kern Ave" required maxlength="120">
+    <label><input type="checkbox" id="exact"> Exact match</label>
     <button class="primary" type="submit">Add</button>
     <span id="err" class="err"></span>
   </form>
@@ -455,7 +498,7 @@ td{padding:.55rem .25rem;border-bottom:1px solid #f3f4f6;vertical-align:middle}
 <div class="card">
   <h2>Current keywords</h2>
   <table>
-    <thead><tr><th></th><th>Term</th><th>Enabled</th><th>Added</th><th></th></tr></thead>
+    <thead><tr><th></th><th>Term</th><th>Enabled</th><th>Exact</th><th>Added</th><th></th></tr></thead>
     <tbody id="tbody"></tbody>
   </table>
 </div>
@@ -472,18 +515,25 @@ async function load(){
   }
   for(const t of data){
     const tr = document.createElement('tr');
+    const term = escapeAttr(t.term);
     tr.innerHTML = `
       <td><span class="dot" style="background:${t.color}"></span></td>
       <td>${escapeHtml(t.term)}</td>
       <td>
         <label class="toggle">
-          <input type="checkbox" ${t.enabled? 'checked':''} onchange="toggle('${escapeAttr(t.term)}', this.checked)">
+          <input type="checkbox" ${t.enabled? 'checked':''} onchange="patchField('${term}','enabled', this.checked)">
+          <span class="slider"></span>
+        </label>
+      </td>
+      <td>
+        <label class="toggle">
+          <input type="checkbox" ${t.exact_match? 'checked':''} onchange="patchField('${term}','exact_match', this.checked)">
           <span class="slider"></span>
         </label>
       </td>
       <td class="muted">${(t.created_at||'').slice(0,10)}</td>
       <td style="text-align:right">
-        <button class="ghost" onclick="del('${escapeAttr(t.term)}')">Delete</button>
+        <button class="ghost" onclick="del('${term}')">Delete</button>
       </td>`;
     tb.appendChild(tr);
   }
@@ -494,6 +544,7 @@ function escapeAttr(s){return s.replace(/['\\\\]/g, c => '\\\\'+c)}
 async function addTerm(e){
   e.preventDefault();
   const input = document.getElementById('term');
+  const exact = document.getElementById('exact');
   const err = document.getElementById('err');
   err.textContent = '';
   const term = input.value.trim();
@@ -501,7 +552,7 @@ async function addTerm(e){
   const r = await fetch('/api/keywords', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({term})
+    body: JSON.stringify({term, exact_match: exact.checked})
   });
   if(!r.ok){
     const j = await r.json().catch(()=>({error:r.statusText}));
@@ -509,21 +560,41 @@ async function addTerm(e){
     return;
   }
   input.value = '';
+  exact.checked = false;
   load();
 }
 
-async function toggle(term, enabled){
+async function patchField(term, field, value){
   await fetch('/api/keywords/' + encodeURIComponent(term), {
     method:'PATCH',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({enabled})
+    body: JSON.stringify({[field]: value})
   });
 }
 
 async function del(term){
-  if(!confirm('Delete keyword "'+term+'"? Existing permits already tagged with it stay in the DB.')) return;
-  const r = await fetch('/api/keywords/' + encodeURIComponent(term), {method:'DELETE'});
-  if(r.ok) load();
+  const c = await fetch('/api/keywords/' + encodeURIComponent(term) + '/permit-count').then(r=>r.json());
+  const count = c.count || 0;
+  let cascade = false;
+  if(count > 0){
+    const choice = prompt(
+      `Keyword "${term}" has ${count} associated permit(s).\n\n` +
+      `Type DELETE to remove the keyword only (permits stay in the DB).\n` +
+      `Type PURGE to remove the keyword AND all ${count} permit(s).\n` +
+      `Anything else cancels.`
+    );
+    if(choice === 'PURGE'){ cascade = true; }
+    else if(choice !== 'DELETE'){ return; }
+  } else {
+    if(!confirm(`Delete keyword "${term}"?`)) return;
+  }
+  const url = '/api/keywords/' + encodeURIComponent(term) + (cascade ? '?cascade=1' : '');
+  const r = await fetch(url, {method:'DELETE'});
+  if(r.ok){
+    const j = await r.json().catch(()=>({}));
+    if(cascade) alert(`Removed ${j.deleted_permits ?? count} permit(s).`);
+    load();
+  }
 }
 
 async function runNow(e){
@@ -553,7 +624,10 @@ def keywords_api():
     if not term:
         return jsonify({"error": "term required"}), 400
     try:
-        row = add_search_term(term, color=body.get("color"))
+        row = add_search_term(
+            term, color=body.get("color"),
+            exact_match=bool(body.get("exact_match")),
+        )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 409
     return jsonify(row), 201
@@ -563,17 +637,27 @@ def keywords_api():
 def keyword_item_api(term):
     try:
         if request.method == "DELETE":
-            delete_search_term(term)
-            return ("", 204)
+            cascade = request.args.get("cascade") in ("1", "true", "yes")
+            removed = delete_search_term(term, cascade_permits=cascade)
+            return jsonify({"deleted_permits": removed}), 200
         body = request.get_json(silent=True) or {}
         update_search_term(
             term,
             enabled=body.get("enabled") if "enabled" in body else None,
             color=body.get("color"),
+            exact_match=body.get("exact_match") if "exact_match" in body else None,
         )
         return ("", 204)
     except KeyError:
         return jsonify({"error": f"unknown term: {term}"}), 404
+
+
+@app.route("/api/keywords/<path:term>/permit-count")
+def keyword_permit_count(term):
+    conn = _db()
+    n = conn.execute("SELECT COUNT(*) FROM permits WHERE keyword = ?", (term,)).fetchone()[0]
+    conn.close()
+    return jsonify({"term": term, "count": n})
 
 
 @app.route("/api/run-check", methods=["POST"])
@@ -581,6 +665,18 @@ def run_check_api():
     from checker import run_check
     new_found = run_check()
     return jsonify({"new_found": new_found})
+
+
+@app.route("/api/permits/<case_id>/favorite", methods=["PUT", "DELETE"])
+def permit_favorite_api(case_id):
+    fav = 1 if request.method == "PUT" else 0
+    conn = _db()
+    cur = conn.execute("UPDATE permits SET favorite = ? WHERE case_id = ?", (fav, case_id))
+    conn.commit()
+    conn.close()
+    if cur.rowcount == 0:
+        return jsonify({"error": f"unknown permit: {case_id}"}), 404
+    return jsonify({"case_id": case_id, "favorite": bool(fav)})
 
 
 @app.route("/api/stats.json")
