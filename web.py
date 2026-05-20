@@ -43,6 +43,7 @@ _NAV = """
   <a href="/" class="{% if active=='list' %}active{% endif %}">&#9776; List</a>
   <a href="/map" class="{% if active=='map' %}active{% endif %}">&#9906; Map</a>
   <a href="/keywords" class="{% if active=='keywords' %}active{% endif %}">&#9873; Keywords</a>
+  <a href="/settings" class="{% if active=='settings' %}active{% endif %}">&#9881; Settings</a>
   <a href="https://gilroyca-energovweb.tylerhost.net/apps/SelfService#/search?m=1&fm=2&ps=10&pn=1&em=true"
      target="_blank">&#8599; Gilroy Portal</a>
 </nav>
@@ -665,6 +666,147 @@ def run_check_api():
     from checker import run_check
     new_found = run_check()
     return jsonify({"new_found": new_found})
+
+
+# ---------------------------------------------------------------------------
+# Settings page + API
+# ---------------------------------------------------------------------------
+
+_SETTINGS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Settings — Gilroy Permits</title>
+<style>
+""" + _BASE_CSS + """
+.card{background:#fff;border-radius:.5rem;box-shadow:0 1px 3px rgba(0,0,0,.1);padding:1.5rem;max-width:680px;margin-bottom:1rem}
+.card h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;color:#374151}
+.row{display:grid;grid-template-columns:140px 1fr;gap:.5rem 1rem;align-items:center;margin-bottom:.6rem}
+.row label{font-size:.85rem;color:#374151}
+.row input[type=text], .row input[type=password], .row input[type=number]{
+  width:100%;padding:.4rem .6rem;border:1px solid #d1d5db;border-radius:.375rem;font-size:.9rem
+}
+.row input:focus{border-color:#2563eb;outline:none;box-shadow:0 0 0 2px #dbeafe}
+.checks{display:flex;gap:1.25rem;flex-wrap:wrap;margin:.5rem 0 1rem 140px}
+.checks label{display:flex;gap:.4rem;align-items:center;font-size:.85rem;cursor:pointer}
+.actions{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-top:.75rem}
+button{padding:.45rem 1rem;border:0;border-radius:.375rem;font-size:.875rem;font-weight:500;cursor:pointer}
+button.primary{background:#2563eb;color:#fff}
+button.secondary{background:#e5e7eb;color:#374151}
+button.primary:hover{background:#1d4ed8}
+button.secondary:hover{background:#d1d5db}
+#status{font-size:.85rem}
+#status.ok{color:#16a34a}
+#status.err{color:#dc2626}
+.hint{color:#6b7280;font-size:.8rem;margin-top:.4rem}
+.warn{color:#92400e;background:#fef3c7;border:1px solid #fde68a;border-radius:.375rem;padding:.5rem .75rem;font-size:.8rem;margin-top:.5rem}
+</style>
+</head>
+<body>
+""" + _NAV + """
+<div class="page">
+<h1>Settings</h1>
+<p class="meta">Configure SMTP for alerts on favorited permits. Emails fire after each run-check if any starred permit has a field change.</p>
+
+<div class="card">
+  <h2>SMTP / email alerts</h2>
+  <form onsubmit="save(event)">
+    <div class="row"><label>Host</label><input type="text" id="host" placeholder="smtp.example.com"></div>
+    <div class="row"><label>Port</label><input type="number" id="port" value="587" min="1" max="65535"></div>
+    <div class="row"><label>Username</label><input type="text" id="username" autocomplete="off"></div>
+    <div class="row"><label>Password</label><input type="password" id="password" autocomplete="new-password" placeholder="(unchanged)"></div>
+    <div class="checks">
+      <label><input type="checkbox" id="use_tls"> STARTTLS</label>
+      <label><input type="checkbox" id="use_ssl"> SSL (implicit)</label>
+    </div>
+    <div class="row"><label>From</label><input type="text" id="from_addr" placeholder="permits@example.com"></div>
+    <div class="row"><label>To</label><input type="text" id="to_addr" placeholder="you@example.com"></div>
+    <div class="row"><label>Base URL</label><input type="text" id="base_url" placeholder="http://192.168.6.57:5001"></div>
+    <div class="checks">
+      <label><input type="checkbox" id="enabled"> Alerts enabled</label>
+    </div>
+    <div class="actions">
+      <button class="primary" type="submit">Save</button>
+      <button class="secondary" type="button" onclick="test()">Send test email</button>
+      <span id="status"></span>
+    </div>
+    <p class="hint">Base URL is used to build clickable links in the alert emails.</p>
+    <p class="warn">Password is stored in plaintext in the SQLite DB on the host volume. Acceptable for a home-network single-user setup; not for shared infra.</p>
+  </form>
+</div>
+</div>
+<script>
+async function load(){
+  const r = await fetch('/api/settings');
+  const s = await r.json();
+  for(const k of ['host','port','username','password','from_addr','to_addr','base_url']){
+    document.getElementById(k).value = s[k] ?? '';
+  }
+  for(const k of ['use_tls','use_ssl','enabled']){
+    document.getElementById(k).checked = !!s[k];
+  }
+}
+function val(id){ return document.getElementById(id).value; }
+function chk(id){ return document.getElementById(id).checked; }
+function setStatus(msg, ok){
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = ok ? 'ok' : 'err';
+  setTimeout(()=>{ el.textContent=''; el.className=''; }, 5000);
+}
+async function save(e){
+  e.preventDefault();
+  const body = {
+    host: val('host'), port: parseInt(val('port'))||587,
+    username: val('username'),
+    password: val('password') || '***',  // *** means keep existing
+    use_tls: chk('use_tls'), use_ssl: chk('use_ssl'),
+    from_addr: val('from_addr'), to_addr: val('to_addr'),
+    base_url: val('base_url'), enabled: chk('enabled'),
+  };
+  const r = await fetch('/api/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  if(r.ok){ setStatus('Saved', true); document.getElementById('password').value=''; load(); }
+  else { const j = await r.json().catch(()=>({})); setStatus(j.error || 'Save failed', false); }
+}
+async function test(){
+  setStatus('Sending…', true);
+  const r = await fetch('/api/settings/test', {method:'POST'});
+  const j = await r.json().catch(()=>({}));
+  if(r.ok && j.ok){ setStatus('Sent — check your inbox', true); }
+  else { setStatus('Failed: ' + (j.error || r.statusText), false); }
+}
+load();
+</script>
+</body></html>"""
+
+
+@app.route("/settings")
+def settings_view():
+    return render_template_string(_SETTINGS_HTML, active="settings")
+
+
+@app.route("/api/settings", methods=["GET", "PUT"])
+def settings_api():
+    from alerts import get_smtp_settings_safe, save_smtp_settings
+    if request.method == "GET":
+        return jsonify(get_smtp_settings_safe())
+    body = request.get_json(silent=True) or {}
+    try:
+        save_smtp_settings(**body)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(get_smtp_settings_safe())
+
+
+@app.route("/api/settings/test", methods=["POST"])
+def settings_test_api():
+    from alerts import send_test
+    try:
+        send_test()
+        return jsonify({"ok": True})
+    except Exception as exc:
+        log_msg = f"{type(exc).__name__}: {exc}"
+        return jsonify({"ok": False, "error": log_msg}), 500
 
 
 @app.route("/api/permits/<case_id>/favorite", methods=["PUT", "DELETE"])

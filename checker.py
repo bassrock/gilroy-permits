@@ -72,6 +72,22 @@ def init_db():
                 created_at  TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS smtp_settings (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                host        TEXT,
+                port        INTEGER NOT NULL DEFAULT 587,
+                username    TEXT,
+                password    TEXT,
+                use_tls     INTEGER NOT NULL DEFAULT 1,
+                use_ssl     INTEGER NOT NULL DEFAULT 0,
+                from_addr   TEXT,
+                to_addr     TEXT,
+                base_url    TEXT,
+                enabled     INTEGER NOT NULL DEFAULT 0,
+                updated_at  TEXT
+            )
+        """)
         # Migrate existing DBs that are missing the newer columns
         _add_column_if_missing(conn, "permits", "issue_date", "TEXT")
         _add_column_if_missing(conn, "permits", "lat", "REAL")
@@ -255,9 +271,13 @@ def _fetch_page(keyword: str, page: int, exact_match: bool = EXACT_MATCH) -> dic
     return resp.json()["Result"]
 
 
+_WATCHED_FIELDS = ("status", "issue_date", "description", "address")
+
+
 def run_check() -> int:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     total_new = 0
+    favorite_changes: list[dict] = []
     terms = get_search_terms(enabled_only=True)
     if not terms:
         log.warning("No enabled search terms — skipping run.")
@@ -288,7 +308,19 @@ def run_check() -> int:
                     cid = e.get("CaseId")
                     if not cid:
                         continue
-                    try:
+                    new_vals = {
+                        "status":      e.get("CaseStatus"),
+                        "address":     e.get("AddressDisplay"),
+                        "issue_date":  (e.get("IssueDate") or "")[:10],
+                        "description": e.get("Description") or "",
+                    }
+                    existing = conn.execute(
+                        "SELECT status, issue_date, description, address, favorite, case_number "
+                        "FROM permits WHERE case_id = ?",
+                        (cid,),
+                    ).fetchone()
+
+                    if existing is None:
                         conn.execute(
                             """INSERT INTO permits
                                (case_id, case_number, case_type, status, address,
@@ -298,19 +330,40 @@ def run_check() -> int:
                                 cid,
                                 e.get("CaseNumber"),
                                 e.get("CaseType"),
-                                e.get("CaseStatus"),
-                                e.get("AddressDisplay"),
+                                new_vals["status"],
+                                new_vals["address"],
                                 (e.get("ApplyDate") or "")[:10],
-                                (e.get("IssueDate") or "")[:10],
-                                e.get("Description") or "",
+                                new_vals["issue_date"],
+                                new_vals["description"],
                                 keyword,
                                 now,
                             ),
                         )
                         new_permits.append(e)
                         page_new += 1
-                    except sqlite3.IntegrityError:
-                        pass  # already known
+                        continue
+
+                    diffs = {
+                        f: ((existing[f] or ""), (new_vals[f] or ""))
+                        for f in _WATCHED_FIELDS
+                        if (existing[f] or "") != (new_vals[f] or "")
+                    }
+                    if diffs:
+                        conn.execute(
+                            "UPDATE permits SET status=?, issue_date=?, description=?, address=? "
+                            "WHERE case_id=?",
+                            (
+                                new_vals["status"], new_vals["issue_date"],
+                                new_vals["description"], new_vals["address"], cid,
+                            ),
+                        )
+                        if existing["favorite"]:
+                            favorite_changes.append({
+                                "case_id":     cid,
+                                "case_number": existing["case_number"],
+                                "keyword":     keyword,
+                                "diffs":       diffs,
+                            })
 
                 log.info("  page %d/%d — %d new", page, total_pages, page_new)
 
@@ -334,5 +387,13 @@ def run_check() -> int:
 
         conn.execute("INSERT INTO runs (ran_at, new_found) VALUES (?,?)", (now, total_new))
 
-    log.info("Check complete — %d new total.", total_new)
+    log.info("Check complete — %d new total, %d favorite change(s).", total_new, len(favorite_changes))
+
+    if favorite_changes:
+        try:
+            from alerts import send_change_digest
+            send_change_digest(favorite_changes)
+        except Exception as exc:
+            log.error("Failed to send alert email: %s", exc)
+
     return total_new
