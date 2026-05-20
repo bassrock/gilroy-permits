@@ -6,6 +6,7 @@ services:
     ports:
       - "5001:5000"
     environment:
+      # SEARCH_TERMS only seeds the DB on first boot — manage live list at /keywords.
       - SEARCH_TERMS=solar,fiber,frontier
       - CHECK_TIME=08:00
       - EXACT_MATCH=false

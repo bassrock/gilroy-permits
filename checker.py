@@ -19,9 +19,16 @@ _HEADERS = {
 }
 
 DB_PATH = os.environ.get("DB_PATH", "/data/permits.db")
-SEARCH_TERMS = [t.strip() for t in os.environ.get("SEARCH_TERMS", "solar").split(",") if t.strip()]
+_SEED_TERMS = [t.strip() for t in os.environ.get("SEARCH_TERMS", "solar").split(",") if t.strip()]
 EXACT_MATCH = os.environ.get("EXACT_MATCH", "false").lower() == "true"
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
+
+# Distinct colors used for the keyword pills/map dots. Index 0..2 preserved
+# for the original solar/fiber/frontier ordering so existing UIs look the same.
+_COLOR_PALETTE = [
+    "#f59e0b", "#3b82f6", "#8b5cf6", "#ef4444", "#10b981", "#ec4899",
+    "#14b8a6", "#f97316", "#84cc16", "#6366f1", "#a855f7", "#06b6d4",
+]
 
 
 def get_db():
@@ -56,10 +63,20 @@ def init_db():
                 new_found INTEGER NOT NULL DEFAULT 0
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS search_terms (
+                term       TEXT PRIMARY KEY,
+                color      TEXT NOT NULL,
+                enabled    INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+        """)
         # Migrate existing DBs that are missing the newer columns
         _add_column_if_missing(conn, "permits", "issue_date", "TEXT")
         _add_column_if_missing(conn, "permits", "lat", "REAL")
         _add_column_if_missing(conn, "permits", "lng", "REAL")
+
+        _bootstrap_search_terms(conn)
 
 
 def _add_column_if_missing(conn, table, col, col_type):
@@ -67,6 +84,97 @@ def _add_column_if_missing(conn, table, col, col_type):
     if col not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
         log.info("Migrated: added column %s.%s", table, col)
+
+
+def _next_color(used: set[str]) -> str:
+    for c in _COLOR_PALETTE:
+        if c not in used:
+            return c
+    return _COLOR_PALETTE[len(used) % len(_COLOR_PALETTE)]
+
+
+def _bootstrap_search_terms(conn) -> None:
+    """Seed search_terms from SEARCH_TERMS env var on first run only.
+
+    Once the table has rows, the env var is ignored — the UI owns the list.
+    Also backfills from existing permits.keyword values so old DBs surface
+    their historical keywords in the management UI.
+    """
+    if conn.execute("SELECT 1 FROM search_terms LIMIT 1").fetchone():
+        return
+
+    historical = [
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT keyword FROM permits WHERE keyword IS NOT NULL AND keyword != ''"
+        )
+    ]
+    seed = list(dict.fromkeys([*_SEED_TERMS, *historical]))  # de-dupe, preserve order
+    if not seed:
+        return
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    used: set[str] = set()
+    for term in seed:
+        color = _next_color(used)
+        used.add(color)
+        conn.execute(
+            "INSERT OR IGNORE INTO search_terms (term, color, enabled, created_at) VALUES (?,?,1,?)",
+            (term, color, now),
+        )
+    log.info("Bootstrapped %d search term(s) into DB: %s", len(seed), ", ".join(seed))
+
+
+def get_search_terms(enabled_only: bool = True) -> list[dict]:
+    with get_db() as conn:
+        q = "SELECT term, color, enabled, created_at FROM search_terms"
+        if enabled_only:
+            q += " WHERE enabled = 1"
+        q += " ORDER BY created_at ASC"
+        return [dict(r) for r in conn.execute(q)]
+
+
+def add_search_term(term: str, color: str | None = None) -> dict:
+    term = term.strip()
+    if not term:
+        raise ValueError("term required")
+    with get_db() as conn:
+        if conn.execute("SELECT 1 FROM search_terms WHERE term = ?", (term,)).fetchone():
+            raise ValueError(f"term already exists: {term}")
+        if not color:
+            used = {r[0] for r in conn.execute("SELECT color FROM search_terms")}
+            color = _next_color(used)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute(
+            "INSERT INTO search_terms (term, color, enabled, created_at) VALUES (?,?,1,?)",
+            (term, color, now),
+        )
+    log.info("Added search term: %s", term)
+    return {"term": term, "color": color, "enabled": 1, "created_at": now}
+
+
+def update_search_term(term: str, *, enabled: bool | None = None, color: str | None = None) -> None:
+    sets, args = [], []
+    if enabled is not None:
+        sets.append("enabled = ?")
+        args.append(1 if enabled else 0)
+    if color:
+        sets.append("color = ?")
+        args.append(color)
+    if not sets:
+        return
+    args.append(term)
+    with get_db() as conn:
+        cur = conn.execute(f"UPDATE search_terms SET {', '.join(sets)} WHERE term = ?", args)
+        if cur.rowcount == 0:
+            raise KeyError(term)
+
+
+def delete_search_term(term: str) -> None:
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM search_terms WHERE term = ?", (term,))
+        if cur.rowcount == 0:
+            raise KeyError(term)
+    log.info("Deleted search term: %s", term)
 
 
 def _build_body(keyword: str, page: int) -> dict:
@@ -122,9 +230,15 @@ def _fetch_page(keyword: str, page: int) -> dict:
 def run_check() -> int:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     total_new = 0
+    terms = [t["term"] for t in get_search_terms(enabled_only=True)]
+    if not terms:
+        log.warning("No enabled search terms — skipping run.")
+        with get_db() as conn:
+            conn.execute("INSERT INTO runs (ran_at, new_found) VALUES (?,?)", (now, 0))
+        return 0
 
     with get_db() as conn:
-        for keyword in SEARCH_TERMS:
+        for keyword in terms:
             log.info("Checking %r", keyword)
             new_permits = []
             page = 1

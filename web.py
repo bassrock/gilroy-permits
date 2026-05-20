@@ -2,7 +2,11 @@ import os
 import sqlite3
 from datetime import datetime, timezone, timedelta
 
-from flask import Flask, render_template_string, jsonify, abort
+from flask import Flask, render_template_string, jsonify, abort, request
+
+from checker import (
+    add_search_term, delete_search_term, get_search_terms, update_search_term,
+)
 
 app = Flask(__name__)
 DB_PATH = os.environ.get("DB_PATH", "/data/permits.db")
@@ -11,14 +15,20 @@ DB_PATH = os.environ.get("DB_PATH", "/data/permits.db")
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-_KW_COLORS = {
-    "solar":    "#f59e0b",
-    "fiber":    "#3b82f6",
-    "frontier": "#8b5cf6",
-}
+def _kw_color_map(conn=None) -> dict:
+    own = conn is None
+    if own:
+        conn = _db()
+    try:
+        return {r["term"]: r["color"] for r in conn.execute(
+            "SELECT term, color FROM search_terms"
+        ).fetchall()}
+    finally:
+        if own:
+            conn.close()
 
-def _kw_color(kw: str) -> str:
-    return _KW_COLORS.get(kw.lower(), "#6b7280")
+def _kw_color_fn(colors: dict):
+    return lambda kw: colors.get(kw or "", "#6b7280")
 
 def _db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -32,6 +42,7 @@ _NAV = """
 <nav>
   <a href="/" class="{% if active=='list' %}active{% endif %}">&#9776; List</a>
   <a href="/map" class="{% if active=='map' %}active{% endif %}">&#9906; Map</a>
+  <a href="/keywords" class="{% if active=='keywords' %}active{% endif %}">&#9873; Keywords</a>
   <a href="https://gilroyca-energovweb.tylerhost.net/apps/SelfService#/search?m=1&fm=2&ps=10&pn=1&em=true"
      target="_blank">&#8599; Gilroy Portal</a>
 </nav>
@@ -151,7 +162,8 @@ def index():
         "SELECT *, (first_seen >= ?) AS is_new FROM permits ORDER BY first_seen DESC, apply_date DESC",
         (cutoff,),
     ).fetchall()
-    keywords = [(r[0], _kw_color(r[0])) for r in conn.execute(
+    colors = _kw_color_map(conn)
+    keywords = [(r[0], colors.get(r[0], "#6b7280")) for r in conn.execute(
         "SELECT DISTINCT keyword FROM permits ORDER BY keyword"
     ).fetchall()]
     row = conn.execute("SELECT ran_at FROM runs ORDER BY id DESC LIMIT 1").fetchone()
@@ -159,7 +171,7 @@ def index():
     conn.close()
     return render_template_string(
         _LIST_HTML, permits=permits, keywords=keywords,
-        total=len(permits), last_run=last_run, kw_color=_kw_color,
+        total=len(permits), last_run=last_run, kw_color=_kw_color_fn(colors),
         active="list",
     )
 
@@ -238,10 +250,11 @@ _DETAIL_HTML = """<!DOCTYPE html>
 def detail(case_id):
     conn = _db()
     p = conn.execute("SELECT * FROM permits WHERE case_id=?", (case_id,)).fetchone()
+    colors = _kw_color_map(conn)
     conn.close()
     if not p:
         abort(404)
-    return render_template_string(_DETAIL_HTML, p=p, kw_color=_kw_color, active="")
+    return render_template_string(_DETAIL_HTML, p=p, kw_color=_kw_color_fn(colors), active="")
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +305,7 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
 let allMarkers = [];
 let hiddenKws = new Set();
 
-function getColor(kw){ return KW_COLORS[kw.toLowerCase()] || '#6b7280'; }
+function getColor(kw){ return KW_COLORS[kw] || '#6b7280'; }
 
 function makeMarker(p){
   const m = L.circleMarker([p.lat, p.lng], {
@@ -308,7 +321,7 @@ function makeMarker(p){
     `<span style="color:#6b7280;font-size:.75rem">Applied: ${p.apply_date || '—'}</span>`,
     {maxWidth: 280}
   );
-  m._kw = p.keyword.toLowerCase();
+  m._kw = p.keyword;
   m._text = (p.case_number + ' ' + p.address + ' ' + p.case_type).toLowerCase();
   m._cid = p.case_id;
   return m;
@@ -347,9 +360,8 @@ function applySearch(){
 }
 
 function toggleKw(kw, el){
-  const k = kw.toLowerCase();
-  if(hiddenKws.has(k)){ hiddenKws.delete(k); el.style.opacity='1'; }
-  else { hiddenKws.add(k); el.style.opacity='.35'; }
+  if(hiddenKws.has(kw)){ hiddenKws.delete(kw); el.style.opacity='1'; }
+  else { hiddenKws.add(kw); el.style.opacity='.35'; }
   applySearch();
 }
 </script>
@@ -358,10 +370,10 @@ function toggleKw(kw, el){
 
 @app.route("/map")
 def map_view():
-    from flask import request as req
-    highlight = req.args.get("highlight", "")
+    highlight = request.args.get("highlight", "")
     conn = _db()
-    keywords = [(r[0], _kw_color(r[0])) for r in conn.execute(
+    colors = _kw_color_map(conn)
+    keywords = [(r[0], colors.get(r[0], "#6b7280")) for r in conn.execute(
         "SELECT DISTINCT keyword FROM permits ORDER BY keyword"
     ).fetchall()]
     total = conn.execute("SELECT count(*) FROM permits").fetchone()[0]
@@ -386,6 +398,189 @@ def permits_json():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+# ---------------------------------------------------------------------------
+# Keywords management page + API
+# ---------------------------------------------------------------------------
+
+_KEYWORDS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Keywords — Gilroy Permits</title>
+<style>
+""" + _BASE_CSS + """
+.card{background:#fff;border-radius:.5rem;box-shadow:0 1px 3px rgba(0,0,0,.1);padding:1.25rem;max-width:720px;margin-bottom:1rem}
+.card h2{font-size:1rem;font-weight:700;margin-bottom:.75rem;color:#374151}
+form.add{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+form.add input[type=text]{flex:1;min-width:180px;padding:.45rem .7rem;border:1px solid #d1d5db;border-radius:.375rem;font-size:.9rem}
+form.add input[type=text]:focus{border-color:#2563eb;outline:none;box-shadow:0 0 0 2px #dbeafe}
+button{padding:.45rem 1rem;border:0;border-radius:.375rem;font-size:.875rem;font-weight:500;cursor:pointer}
+button.primary{background:#2563eb;color:#fff}
+button.primary:hover{background:#1d4ed8}
+button.ghost{background:transparent;color:#dc2626;padding:.2rem .5rem}
+button.ghost:hover{background:#fee2e2;border-radius:.25rem}
+table{width:100%;border-collapse:collapse;font-size:.9rem}
+th{text-align:left;padding:.4rem .25rem;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;border-bottom:1px solid #e5e7eb}
+td{padding:.55rem .25rem;border-bottom:1px solid #f3f4f6;vertical-align:middle}
+.dot{display:inline-block;width:14px;height:14px;border-radius:50%;vertical-align:middle;margin-right:.5rem}
+.toggle{position:relative;display:inline-block;width:36px;height:20px}
+.toggle input{opacity:0;width:0;height:0}
+.slider{position:absolute;inset:0;background:#cbd5e1;border-radius:9999px;transition:.15s;cursor:pointer}
+.slider:before{content:'';position:absolute;height:14px;width:14px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}
+.toggle input:checked + .slider{background:#16a34a}
+.toggle input:checked + .slider:before{transform:translateX(16px)}
+.muted{color:#9ca3af}
+.err{color:#dc2626;font-size:.85rem;margin-left:.5rem}
+.hint{color:#6b7280;font-size:.8rem;margin-top:.4rem}
+</style>
+</head>
+<body>
+""" + _NAV + """
+<div class="page">
+<h1>Search Keywords</h1>
+<p class="meta">Add or remove the keywords the daily checker searches the Gilroy portal for.</p>
+
+<div class="card">
+  <h2>Add keyword</h2>
+  <form class="add" onsubmit="addTerm(event)">
+    <input type="text" id="term" placeholder="e.g. Kern Ave" required maxlength="120">
+    <button class="primary" type="submit">Add</button>
+    <span id="err" class="err"></span>
+  </form>
+  <p class="hint">New keywords take effect on the next daily check (or click <a href="#" onclick="runNow(event)">Run check now</a>).</p>
+</div>
+
+<div class="card">
+  <h2>Current keywords</h2>
+  <table>
+    <thead><tr><th></th><th>Term</th><th>Enabled</th><th>Added</th><th></th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+</div>
+<script>
+async function load(){
+  const r = await fetch('/api/keywords');
+  const data = await r.json();
+  const tb = document.getElementById('tbody');
+  tb.innerHTML = '';
+  if(!data.length){
+    tb.innerHTML = '<tr><td colspan="5" class="muted">No keywords yet — add one above.</td></tr>';
+    return;
+  }
+  for(const t of data){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><span class="dot" style="background:${t.color}"></span></td>
+      <td>${escapeHtml(t.term)}</td>
+      <td>
+        <label class="toggle">
+          <input type="checkbox" ${t.enabled? 'checked':''} onchange="toggle('${escapeAttr(t.term)}', this.checked)">
+          <span class="slider"></span>
+        </label>
+      </td>
+      <td class="muted">${(t.created_at||'').slice(0,10)}</td>
+      <td style="text-align:right">
+        <button class="ghost" onclick="del('${escapeAttr(t.term)}')">Delete</button>
+      </td>`;
+    tb.appendChild(tr);
+  }
+}
+function escapeHtml(s){return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function escapeAttr(s){return s.replace(/['\\\\]/g, c => '\\\\'+c)}
+
+async function addTerm(e){
+  e.preventDefault();
+  const input = document.getElementById('term');
+  const err = document.getElementById('err');
+  err.textContent = '';
+  const term = input.value.trim();
+  if(!term) return;
+  const r = await fetch('/api/keywords', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({term})
+  });
+  if(!r.ok){
+    const j = await r.json().catch(()=>({error:r.statusText}));
+    err.textContent = j.error || 'Failed';
+    return;
+  }
+  input.value = '';
+  load();
+}
+
+async function toggle(term, enabled){
+  await fetch('/api/keywords/' + encodeURIComponent(term), {
+    method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({enabled})
+  });
+}
+
+async function del(term){
+  if(!confirm('Delete keyword "'+term+'"? Existing permits already tagged with it stay in the DB.')) return;
+  const r = await fetch('/api/keywords/' + encodeURIComponent(term), {method:'DELETE'});
+  if(r.ok) load();
+}
+
+async function runNow(e){
+  e.preventDefault();
+  e.target.textContent = 'Running…';
+  const r = await fetch('/api/run-check', {method:'POST'});
+  const j = await r.json().catch(()=>({}));
+  e.target.textContent = r.ok ? `Done — ${j.new_found ?? 0} new` : 'Failed';
+}
+
+load();
+</script>
+</body></html>"""
+
+
+@app.route("/keywords")
+def keywords_view():
+    return render_template_string(_KEYWORDS_HTML, active="keywords")
+
+
+@app.route("/api/keywords", methods=["GET", "POST"])
+def keywords_api():
+    if request.method == "GET":
+        return jsonify(get_search_terms(enabled_only=False))
+    body = request.get_json(silent=True) or {}
+    term = (body.get("term") or "").strip()
+    if not term:
+        return jsonify({"error": "term required"}), 400
+    try:
+        row = add_search_term(term, color=body.get("color"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 409
+    return jsonify(row), 201
+
+
+@app.route("/api/keywords/<path:term>", methods=["PATCH", "DELETE"])
+def keyword_item_api(term):
+    try:
+        if request.method == "DELETE":
+            delete_search_term(term)
+            return ("", 204)
+        body = request.get_json(silent=True) or {}
+        update_search_term(
+            term,
+            enabled=body.get("enabled") if "enabled" in body else None,
+            color=body.get("color"),
+        )
+        return ("", 204)
+    except KeyError:
+        return jsonify({"error": f"unknown term: {term}"}), 404
+
+
+@app.route("/api/run-check", methods=["POST"])
+def run_check_api():
+    from checker import run_check
+    new_found = run_check()
+    return jsonify({"new_found": new_found})
 
 
 @app.route("/api/stats.json")
